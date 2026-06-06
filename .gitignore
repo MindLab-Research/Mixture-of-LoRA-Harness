@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Runtime outputs
+logs/
+results/
+*.jsonl
+*.log
+*.out
+
+# Model artifacts must not be committed.
+shadow_loras/
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+
+# Local configuration
+.env
+*.local
