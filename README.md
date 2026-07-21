@@ -1,171 +1,333 @@
-# Mixture-of-LoRA Harness
+# Macaron-V1-Venti Mixture-of-LoRA Harness
 
-Mixture-of-LoRA Harness is a lightweight router and SGLang overlay for serving
-multiple LoRA adapters behind one OpenAI-compatible endpoint.
+This repository serves **Macaron-V1-Venti**, a 748B-parameter model composed
+of a 744B GLM-5.2 base model and four 1B LoRA specialists. It exposes one
+OpenAI-compatible model while routing each request through the appropriate
+adapter.
 
-The repository is intentionally source-only. It does not include model weights,
-shadow LoRA directories, logs, trace data, or benchmark results.
+The release uses native multi-LoRA support from either vLLM or SGLang. No
+engine monkey patch is required.
 
-## Components
+## Architecture
 
-- `mol_harness/`: LoRA Library parser, router prompt builder, and deterministic
-  metadata guardrails.
-- `examples/lora_library/`: small placeholder task descriptions for L0-L4.
-- `lora_library/glm51_current/`: sanitized L0-L4 task descriptions used in our
-  GLM5.1 experiments. It contains metadata only, with placeholder checkpoint
-  and dataset paths.
-- `examples/route_decode_client.py`: one OpenAI-compatible completion request
-  that uses `route_decode_v2` custom params.
-- `oai_api_connectivity_test/`: external-client examples for `lora_adapter_id`
-  selection, including `auto` routing and direct `L0`-`L4` adapter inference.
-- `examples/scripts/create_shadow_loras.py`: prepares SGLang-loadable shadow
-  LoRA directories by patching PEFT config and symlinking weights.
-- `sglang_patch/`: non-invasive SGLang overlay patch. It is activated with
-  `PYTHONPATH`, not by editing the installed SGLang source tree.
+```text
+OpenAI client
+    |
+    v
+MoL Proxy :30000
+    |
+    v
+SGLang Model Gateway :30001
+    |
+    v
+vLLM or SGLang Engine :8000
+    |
+    +-- L0  general chat and model identity
+    +-- L1  personal agent and service workflows
+    +-- L2  coding and terminal workflows
+    `-- L3  UI and A2UI generation
+```
 
-## Routing Design
+For every new user request, the Proxy performs:
 
-L0 is both the entry router LoRA and the general chat LoRA. Specialist LoRAs are
-selected only when the current user request clearly matches a task family.
+1. **Route**: L0 classifies the current request into one canonical adapter.
+2. **Answer**: the selected adapter answers using its own conversation view.
+3. **Summary**: the selected adapter creates a short cross-adapter summary
+   that is stored by the Proxy and is not returned to the client.
 
-The router is hybrid:
+Tool-result continuations remain on the adapter that issued the tool call and
+do not run another route hop. Stable per-adapter prompts allow the native
+engine prefix cache to reuse each adapter's existing KV prefix.
 
-- The prompt route is produced by the model from task descriptions, rules, and
-  examples.
-- The metadata guardrail can override noisy model output when strong LoRA
-  Library signals clearly match a specialist.
-- Invalid, missing, or ambiguous routes fall back to L0.
+## Release Contents
 
-The intended multi-turn policy is:
+- `mol_harness/`: Proxy, router, state management, Chat Completions, and
+  Responses API implementation.
+- `lora_library/mol_glm52/`: the four evaluated Macaron-V1-Venti adapter
+  descriptions and routing boundaries.
+- `sgl-model-gateway/src/`: Gateway control plane and HTTP routing source.
+- `mol_harness/scripts/`: native vLLM and SGLang GLM-5.2 launchers.
 
-- L0 routing sees only the current user query.
-- L0 chat can see full conversation history.
-- Specialist LoRAs see the current query plus same-task history.
-- Cross-task specialist history is masked at the harness policy level.
-- After a specialist finishes a turn, the next new task starts from L0 again.
-- If `enable_kv_reuse=true`, the patched SGLang path can reuse the continuous
-  current-query prefix after removing router-only prompt/decode tokens.
+Model weights, logs, benchmarks, experimental patches, and test suites are not
+included.
+
+## Requirements
+
+- Linux and a CUDA environment that supports GLM-5.2.
+- Python 3.10 or newer.
+- Either vLLM 0.24.0 or SGLang 0.5.13.post1 with native multi-LoRA support.
+- Rust, Cargo, `protoc`, a C/C++ toolchain, and `pkg-config` to build the
+  Gateway.
+- `curl` and `jq` for registration and health checks.
+
+The checked-in engine profiles use tensor parallelism across eight GPUs.
+Adjust parallelism, memory utilization, context length, and LoRA residency for
+different hardware before serving traffic.
+
+## Model Layout
+
+Both engine launchers use this layout by default:
+
+```text
+/root/glm52_local/
+|-- base/
+|   |-- config.json
+|   `-- model-*.safetensors
+`-- loras/
+    |-- L0/
+    |   |-- adapter_config.json
+    |   `-- adapter_model.safetensors
+    |-- L1/
+    |-- L2/
+    `-- L3/
+```
+
+Override `MODEL_ROOT`, or set `MODEL_PATH` and `LORA_ROOT` separately for
+the SGLang launcher. Keep the engine-visible adapter names exactly
+`L0`, `L1`, `L2`, and `L3`.
 
 ## Install
 
 ```bash
 git clone https://github.com/MindLab-Research/Mixture-of-LoRA-Harness-alpha.git
 cd Mixture-of-LoRA-Harness-alpha
-python3 -m pip install -r requirements.txt
+
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-## Configure a LoRA Library
+Install vLLM or SGLang in the CUDA environment used by the Engine. Engine
+packages are intentionally not pinned in `requirements.txt` because their
+wheels are CUDA- and host-specific.
 
-Copy `examples/lora_library/` and edit each `source_path` and `adapter_name`:
+Build the Gateway:
 
 ```bash
-cp -r examples/lora_library my_lora_library
-$EDITOR my_lora_library/L2.md
+cd sgl-model-gateway
+command -v protoc
+cargo build --release --bin smg --features vendored-openssl
+cd ..
 ```
 
-Each markdown file defines one route:
+The binary is written to `sgl-model-gateway/target/release/smg`.
 
-- `id`: route id returned by the router, for example `L2`.
-- `adapter_name`: the server-visible LoRA model id, for example `l2_coding`.
-- `source_path`: the local adapter checkpoint directory. This is where the LoRA
-  adapter path is declared in the library.
+## Start an Engine
 
-Prepare shadow LoRA directories:
+Choose exactly one of the following engines. Both serve the base model as
+`glm52-fp8-official` and the adapters as `L0` through `L3` on port 8000.
+
+### vLLM
+
+The vLLM launcher is the validated GLM-5.2 FP8 TP8 profile. It checks vLLM
+0.24.0, the GPU inventory, 141 base-model shards, and all four adapter files
+before starting:
 
 ```bash
-python3 examples/scripts/create_shadow_loras.py \
-  --library-dir my_lora_library \
-  --output-dir shadow_loras
+MODEL_ROOT=/root/glm52_local \
+VLLM_CONFIG_CHECK_ONLY=1 \
+  ./mol_harness/scripts/start_glm52_b300_tp8_4lora.sh
+
+MODEL_ROOT=/root/glm52_local \
+  ./mol_harness/scripts/start_glm52_b300_tp8_4lora.sh
 ```
 
-`shadow_loras/` is ignored by git because it points to model weights.
+The launcher executes `python -m vllm.entrypoints.openai.api_server` with:
 
-This repository also includes `lora_library/glm51_current/`, which preserves
-the current L0-L4 descriptions, routing rules, signal lists, and dataset
-reference structure. Checkpoint and dataset paths are sanitized placeholders;
-no LoRA weights or private storage paths are committed.
+- tensor parallel size 8;
+- `FLASHMLA_SPARSE` attention;
+- native multi-LoRA and prefix caching;
+- GLM reasoning and tool-call parsers;
+- `VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER=0` for FP8 multi-LoRA correctness.
 
-To prepare the GLM5.1 library:
+The default hardware check expects eight GPUs named `NVIDIA L20D` in the
+validated B300 environment. Set `EXPECTED_GPU_COUNT` and
+`EXPECTED_GPU_NAME` to the exact values reported by PyTorch on another
+validated host. Other useful overrides are `PYTHON_BIN`, `HOST`, `PORT`,
+and `KV_CACHE_DTYPE`.
+
+### SGLang
+
+The SGLang launcher uses native multi-LoRA serving and does not load an MoL
+overlay:
 
 ```bash
-python3 examples/scripts/create_shadow_loras.py \
-  --library-dir lora_library/glm51_current \
-  --output-dir shadow_loras
+MODEL_ROOT=/root/glm52_local \
+  ./mol_harness/scripts/start_glm52_sglang_tp8_4lora.sh
 ```
 
-## Start Patched SGLang
+It executes `python -m sglang.launch_server` with TP8, a 262144-token context,
+the four adapters, GLM reasoning/tool parsers, and virtual LoRA experts.
+`--disable-cuda-graph` and `--disable-overlap-schedule` are enabled by
+default because they are the validated correctness-first settings for
+concurrent multi-LoRA requests.
+
+Common overrides:
+
+| Variable | Default |
+|---|---|
+| `MODEL_PATH` | `$MODEL_ROOT/base` |
+| `LORA_ROOT` | `$MODEL_ROOT/loras` |
+| `HOST` / `PORT` | `127.0.0.1` / `8000` |
+| `TP` | `8` |
+| `CONTEXT_LENGTH` | `262144` |
+| `MEM_FRACTION_STATIC` | `0.93` |
+| `MAX_LORAS_PER_BATCH` | `2` |
+
+Append additional native SGLang arguments after the launcher path. Argument
+boundaries and quoted values are preserved by the shell:
 
 ```bash
-export PATCH_ROOT=$PWD/sglang_patch
-export SGLANG_BASE_PYTHON=/path/to/upstream/sglang/python
-export MODEL_PATH=/path/to/base/model
-export MODEL_NAME=your-base-model-name
-export LORA_PATHS_ARGS='l0_chat=shadow_loras/L0 l2_coding=shadow_loras/L2'
-
-bash sglang_patch/scripts/start_sglang_kv_reuse_server.sh
+MODEL_ROOT=/root/glm52_local \
+  ./mol_harness/scripts/start_glm52_sglang_tp8_4lora.sh \
+  --max-running-requests 64
 ```
 
-`LORA_PATHS_ARGS` is where the actual adapter paths are passed to SGLang. After
-startup, requests use `adapter_name`; they do not send filesystem paths.
-
-For an L0-L4 setup:
+For either engine, wait until both endpoints succeed:
 
 ```bash
-export LORA_PATHS_ARGS='l0_chat=shadow_loras/L0 l1_living_vita_tau3=shadow_loras/L1 l2_swe_tb2=shadow_loras/L2 l3_a2ui=shadow_loras/L3 l4_openclaw_pinch=shadow_loras/L4'
+curl -sf http://127.0.0.1:8000/health
+curl -sS http://127.0.0.1:8000/v1/models | jq .
 ```
 
-Configure route decode:
+Confirm that `L0`, `L1`, `L2`, and `L3` appear in the model list.
+
+## Start the Gateway
+
+Start the Gateway with an empty worker registry:
 
 ```bash
-curl -s http://127.0.0.1:30000/v1/configure_lora_router \
+./sgl-model-gateway/target/release/smg launch \
+  --host 127.0.0.1 \
+  --port 30001 \
+  --policy manual \
+  --assignment-mode min_load_then_group \
+  --max-idle-secs 1800
+```
+
+Register the healthy Engine. Set `ENGINE_RUNTIME` to exactly `vllm` or
+`sglang`; the Gateway uses this value to preserve the correct request shape
+for each runtime.
+
+```bash
+ENGINE_RUNTIME=vllm
+
+WORKER_JSON="$(jq -n \
+  --arg runtime "$ENGINE_RUNTIME" \
+  '{
+    url: "http://127.0.0.1:8000",
+    model_id: "glm52-fp8-official",
+    worker_type: "regular",
+    runtime: $runtime,
+    priority: 50,
+    cost: 1.0,
+    labels: {deployment: "macaron-v1-venti"}
+  }')"
+
+REGISTERED="$(curl -sS -X POST http://127.0.0.1:30001/workers \
   -H 'Content-Type: application/json' \
-  -d '{"lora_pool":["l0_chat","l2_coding"],"switch_every_n_tokens":0,"mode":"route_decode_v2"}'
+  -d "$WORKER_JSON")"
+printf '%s\n' "$REGISTERED" | jq .
+WORKER_ID="$(printf '%s' "$REGISTERED" | jq -r '.worker_id')"
+
+until curl -sf "http://127.0.0.1:30001/workers/$WORKER_ID" \
+  | jq -e '.is_healthy == true' >/dev/null; do
+  sleep 5
+done
+
+curl -sf http://127.0.0.1:30001/readiness | jq .
 ```
 
-## Send a Test Request
+For SGLang, use `ENGINE_RUNTIME=sglang`; no other registration field changes.
 
-You can first test metadata routing without a model server:
+## Start the Proxy
 
 ```bash
-python3 examples/offline_router_demo.py \
-  --library-dir examples/lora_library \
-  "Fix a failing pytest in this repository and run verification."
+UPSTREAM=http://127.0.0.1:30001 \
+PROXY_PORT=30000 \
+LIBRARY_DIR=lora_library/mol_glm52 \
+MOL_USE_MODEL_ROUTER=1 \
+MOL_PURE_MODEL_ROUTE=1 \
+SERVED_MODEL_NAME=Macaron-V1-Venti \
+  python3 -m mol_harness.proxy
 ```
 
-To test the patched SGLang path:
+Set `MOL_API_KEY` to require `Authorization: Bearer <key>` on model
+endpoints. `GET /health` remains unauthenticated.
+
+Key Proxy settings:
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `UPSTREAM` | `http://127.0.0.1:30001` | Gateway URL |
+| `PROXY_PORT` | `30000` | Public listener |
+| `LIBRARY_DIR` | `lora_library/mol_glm52` | Macaron routing metadata |
+| `ROUTER_MAX_TOKENS` | `24` | L0 route decode budget |
+| `SUMMARY_MAX_OUT` | `192` | Hidden summary budget |
+| `MOL_MAX_INFLIGHT_REQUESTS` | `256` | Active orchestration limit |
+| `MOL_MAX_QUEUED_REQUESTS` | `256` | Admission queue limit |
+| `CONVO_TTL_S` | `1800` | Idle state lifetime |
+| `MOL_API_KEY` | unset | Optional API authentication |
+
+Use a process supervisor for production. Do not use broad `pkill` commands on
+shared inference hosts.
+
+## Verify
 
 ```bash
-python3 examples/route_decode_client.py \
-  --base-url http://127.0.0.1:30000 \
-  --library-dir my_lora_library \
-  --model l0_chat \
-  "Fix a failing pytest in this repository and run verification."
+curl -sS http://127.0.0.1:8000/health
+curl -sS http://127.0.0.1:30001/readiness | jq .
+curl -sS http://127.0.0.1:30000/health
+curl -sS http://127.0.0.1:30000/v1/models | jq .
 ```
 
-The response includes normal completion text plus `lora_router_*` metadata when
-the patched SGLang overlay is active.
+The Proxy exposes one public model, `Macaron-V1-Venti`. Internal base and
+adapter model names are not returned to clients.
 
-## Validation Boundary
+Chat Completions:
 
-There are two different validation scopes:
+```bash
+curl -sS http://127.0.0.1:30000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Macaron-V1-Venti",
+    "messages": [{"role": "user", "content": "Who are you?"}],
+    "max_tokens": 256
+  }' | jq .
+```
 
-- Route/KV mechanism tests use short completion decodes to verify
-  `route_decode_v2`, same-request LoRA switching, router-token trimming, and
-  the `enable_kv_reuse=true/false` paths.
-- Full task tests with tools are end-to-end task execution tests. They route
-  with L0, switch to the selected adapter, let the adapter issue tool calls, and
-  replay fake tool results until final answer decode. Teacher-forcing runs are
-  diagnostics only and should not be counted as natural model performance.
+Responses API:
 
-Do not compare 16-token route/KV smoke tests with full tool-loop task
-completion scores as if they measured the same thing.
+```bash
+curl -sS http://127.0.0.1:30000/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Macaron-V1-Venti",
+    "input": "Write a Python function that validates an email address.",
+    "max_output_tokens": 512
+  }' | jq .
+```
 
-## Notes
+Supported public endpoints:
 
-- `route_decode_v2` reuses a continuous KV prefix after router-only tokens are
-  trimmed. It does not implement arbitrary non-contiguous GPU KV cache splicing.
-- The overlay is tied to the upstream SGLang version it was derived from. Check
-  `sglang_patch/changed_files.txt` before applying it to a different version.
-- LoRA Library checkpoint and dataset paths are placeholders. No adapter weights
-  or private storage paths are committed; users should replace paths with
-  locations they can access.
+| Method | Path |
+|---|---|
+| `GET` | `/health` |
+| `GET` | `/v1/models` |
+| `POST` | `/v1/chat/completions` |
+| `POST` | `/v1/responses` |
+
+## Shutdown
+
+Stop components in this order:
+
+1. Stop accepting new traffic at the Proxy and allow in-flight requests to
+   drain.
+2. Delete the Engine worker from the Gateway with
+   `DELETE /workers/$WORKER_ID`.
+3. Stop the Gateway.
+4. Stop the vLLM or SGLang Engine.
+
+This prevents new requests from being routed to an Engine that is shutting
+down.

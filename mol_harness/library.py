@@ -14,6 +14,8 @@ class LoRATask:
     level: str = ""
     priority: int = 0
     description: str = ""
+    summary: str = ""
+    router_line: str = ""
     routing_rules: list[str] = field(default_factory=list)
     strong_signals: list[str] = field(default_factory=list)
     positive_signals: list[str] = field(default_factory=list)
@@ -88,6 +90,17 @@ def _section_items(sections: dict[str, list[str]], name: str) -> list[str]:
     return out
 
 
+def _first_sentence(text: str) -> str:
+    """Compact one-liner from a verbose description: collapse whitespace and take
+    the first sentence, capped at 200 chars. Mirrors vllm _mol_routing so the
+    summary fallback matches when a library has no explicit ## Summary section."""
+    text = " ".join((text or "").split())
+    if not text:
+        return ""
+    cut = text.split(". ", 1)[0]
+    return cut[:200].strip()
+
+
 def parse_lora_markdown(path: Path) -> LoRATask:
     text = path.read_text(encoding="utf-8")
     meta, body = _split_front_matter(text)
@@ -105,6 +118,9 @@ def parse_lora_markdown(path: Path) -> LoRATask:
         source_path=meta.get("source_path", ""),
         priority=int(meta.get("priority", "0") or 0),
         description=_section_text(sections, "description"),
+        summary=_section_text(sections, "summary")
+        or _first_sentence(_section_text(sections, "description")),
+        router_line=_section_text(sections, "router_line"),
         routing_rules=_bullets(sections, "routing_rules"),
         strong_signals=_comma_list(sections, "strong_signals"),
         positive_signals=_comma_list(sections, "positive_signals"),

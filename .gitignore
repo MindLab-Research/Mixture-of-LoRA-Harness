@@ -25,3 +25,11 @@ checkpoints/
 # Local configuration
 .env
 *.local
+
+# Local notes / docs / agent state (not part of the fix)
+CLAUDE.md
+.md/
+.claude/
+
+# Local root-level ops scripts (not part of the release)
+/scripts/

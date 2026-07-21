@@ -1,0 +1,7 @@
+# build artifacts (3GB+ — never commit)
+target/
+# rust toolchain cache
+.cargo/
+# prebuilt binary (42MB — build via `cargo build --release --features vendored-openssl`
+# with PROTOC set; do not commit the binary itself)
+bin/sgl-model-gateway
