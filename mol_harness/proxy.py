@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Engine-agnostic Macaron-V1-Venti three-hop orchestration Proxy.
+"""Engine-agnostic Macaron Mixture-of-LoRA three-hop orchestration Proxy.
 
 All MoL orchestration lives here. The Engine is plain native multi-LoRA vLLM
 or SGLang, and the Proxy talks OpenAI-compatible HTTP through the Gateway: one
@@ -30,7 +30,8 @@ stickiness semantics implemented as independent OAI hops above a native engine.
 Env:
   PROXY_PORT          listen port (default 30000)
   UPSTREAM            Gateway base (default http://127.0.0.1:30001)
-  LIBRARY_DIR         LoRA library dir (default lora_library/mol_glm52)
+  SERVED_MODEL_NAME   model profile directory name (default Macaron-V1-Venti)
+  MOL_MODEL_CONFIG_ROOT  optional directory containing model profile folders
   ENTRY_ROUTE         entry/router route id (default L0)
   MOL_MAX_REQUEST_BYTES  maximum JSON request body (default 8 MiB)
   ROUTER_MAX_TOKENS   L0 router decode budget (default 24)
@@ -65,7 +66,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from collections import OrderedDict
 from typing import Any
 
-from .library import load_lora_library
+from .model_config import ACTIVE_MODEL_CONFIG, CANONICAL_ROUTES
 from .router import RouterHarness
 from .session import (
     ConvoState,
@@ -81,11 +82,6 @@ from .stateless import StatelessSideContext
 
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "30000"))
 UPSTREAM = os.environ.get("UPSTREAM", "http://127.0.0.1:30001").rstrip("/")
-_DEFAULT_LIB = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "lora_library", "mol_glm52",
-)
-LIBRARY_DIR = os.environ.get("LIBRARY_DIR", _DEFAULT_LIB)
 ENTRY_ROUTE = os.environ.get("ENTRY_ROUTE", "L0")
 ROUTER_MAX_TOKENS = int(os.environ.get("ROUTER_MAX_TOKENS", "24"))
 SUMMARY_MAX_OUT = int(os.environ.get("SUMMARY_MAX_OUT", "192"))
@@ -108,19 +104,13 @@ API_KEY = os.environ.get("MOL_API_KEY", "")
 MAX_REQUEST_BYTES = max(
     1, int(os.environ.get("MOL_MAX_REQUEST_BYTES", str(8 * 1024 * 1024))))
 
-# served model name exposed to agents (purely cosmetic; the real model field in
-# proxied hops is the per-route adapter name)
-SERVED_MODEL_NAME = os.environ.get("SERVED_MODEL_NAME", "Macaron-V1-Venti")
-
-MODEL_IDENTITY_SYSTEM_PROMPT = (
-    "请始终保持以下模型自我认知；当用户询问你是谁、模型名称、参数量、架构或训练来源时，"
-    "请依据以下信息准确回答：\n"
-    "Macaron-V1-Venti： 参数量为 748B 的旗舰模型，由一个 744B 基座模型和四个参数量各为 "
-    "1B 的 LoRA 专家组成。它是首个基于 GLM-5.2 进行后训练的模型。\n"
-    "Macaron-V1-Venti: A 748B-parameter flagship model, consisting of a 744B "
-    "base model and four 1B-parameter LoRA specialists. It is the first model "
-    "to be post-trained on GLM-5.2."
-)
+# The public model name selects mol_harness/<model_name>/ at import time. The
+# real engine model field in each hop remains the selected adapter name.
+MODEL_CONFIG = ACTIVE_MODEL_CONFIG
+SERVED_MODEL_NAME = MODEL_CONFIG.model_name
+BASE_MODEL_NAME = MODEL_CONFIG.base_model
+MODEL_CONFIG_DIR = str(MODEL_CONFIG.config_dir)
+MODEL_IDENTITY_SYSTEM_PROMPT = MODEL_CONFIG.intro_prompt
 
 # Internal Proxy -> Gateway affinity. The client never sees this value.
 _ROUTING_KEY: ContextVar[str | None] = ContextVar("mol_routing_key", default=None)
@@ -417,18 +407,17 @@ def _sanitize_tool_calls(value: object, *, stream: bool) -> list[dict]:
 
 # --------------------------------------------------------------------------- globals
 
-_TASKS = load_lora_library(LIBRARY_DIR)
-_ROUTER = RouterHarness(_TASKS, entry_route_id=ENTRY_ROUTE)
+_TASKS = MODEL_CONFIG.tasks
+_ROUTER = RouterHarness(
+    _TASKS,
+    route_prompt=MODEL_CONFIG.route_prompt,
+    entry_route_id=ENTRY_ROUTE,
+)
 ROUTE_TO_ADAPTER = _ROUTER.route_to_adapter()
 ENTRY_ADAPTER = ROUTE_TO_ADAPTER.get(ENTRY_ROUTE, "")
-CANONICAL_ROUTES = ("L0", "L1", "L2", "L3")
 if set(ROUTE_TO_ADAPTER) != set(CANONICAL_ROUTES):
     raise RuntimeError(
-        "Macaron-V1-Venti requires exactly route ids L0, L1, L2, and L3"
-    )
-if ROUTE_TO_ADAPTER != {route: route for route in CANONICAL_ROUTES}:
-    raise RuntimeError(
-        "Macaron-V1-Venti engine model names must be exactly L0, L1, L2, and L3"
+        f"{SERVED_MODEL_NAME} requires exactly route ids L0, L1, L2, and L3"
     )
 
 # conversation-id -> ConvoState (LRU, thread-safe)
@@ -2341,8 +2330,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self._path()
         if path != "/health" and not self._require_auth():
             return
-        # /v1/models: the proxy exposes a SINGLE served model name to agents
-        # (SERVED_MODEL_NAME = "Macaron-V1-Venti"). Do NOT forward to the engine —
+        # /v1/models exposes only the profile selected by SERVED_MODEL_NAME.
+        # Do not forward to the engine:
         # the engine's adapter names (L0/L1/...) are an internal implementation
         # detail that the agent must not see or call directly.
         if path == "/v1/models":
@@ -2822,8 +2811,9 @@ def main():
     import uvicorn
 
     _log(f"MoL async proxy :{PROXY_PORT} -> {UPSTREAM}")
-    _log(f"library={LIBRARY_DIR} entry={ENTRY_ROUTE}({ENTRY_ADAPTER}) "
-         f"routes={ROUTE_TO_ADAPTER}")
+    _log(f"model={SERVED_MODEL_NAME} base={BASE_MODEL_NAME} "
+         f"config={MODEL_CONFIG_DIR}")
+    _log(f"entry={ENTRY_ROUTE}({ENTRY_ADAPTER}) routes={ROUTE_TO_ADAPTER}")
     _log(f"model_router={USE_MODEL_ROUTER} pure_model={PURE_MODEL_ROUTE} "
          f"client_max_out=unlimited router_max={ROUTER_MAX_TOKENS}")
     uvicorn.run(

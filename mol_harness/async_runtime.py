@@ -295,10 +295,17 @@ class AsyncGatewayClient:
         return self.release_client
 
     async def is_ready(self) -> bool:
-        """Return whether Gateway reports at least one healthy Engine worker."""
+        """Return readiness for either a Gateway or a direct vLLM upstream."""
         try:
             async with self._client().get(
                     "/readiness", timeout=2.0) as response:
+                await response.read()
+                if response.status == 200:
+                    return True
+                if response.status not in (404, 405):
+                    return False
+            async with self._client().get(
+                    "/health", timeout=2.0) as response:
                 await response.read()
                 return response.status == 200
         except (aiohttp.ClientError, asyncio.TimeoutError):

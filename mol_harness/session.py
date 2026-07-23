@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 import threading
 from typing import Any, Protocol
 
+from .model_config import ACTIVE_MODEL_CONFIG
+
 # OAI message: {"role": str, "content": str | list, ...}
 
 
@@ -355,10 +357,7 @@ def _adopt_system(
         state.system_msgs = list(system_msgs)
 
 
-SUMMARY_SCAFFOLD = (
-    "请用一到两句话总结你刚刚完成了什么，供路由器在用户下一次请求时判断下一步。"
-    "只输出总结本身，不要输出任何其他内容。"
-)
+SUMMARY_SCAFFOLD = ACTIVE_MODEL_CONFIG.summary_prompt
 
 
 def _summary_block(task: Task) -> str:
